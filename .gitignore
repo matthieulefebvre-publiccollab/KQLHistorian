@@ -11,6 +11,7 @@ docs/blog/
 # Customer / meeting artifacts (not for public repo)
 MeetingTranscript.md
 EmailReply.md
+issue/
 
 # Local environment
 .env

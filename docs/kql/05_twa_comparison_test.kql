@@ -1,0 +1,131 @@
+// =====================================================================================
+// TWA side-by-side comparison / validation harness.
+//
+// Run this AFTER deploying 01_schema_and_functions.kql (originals) and
+// 04_twa_corrected_functions.kql (the _v2 corrected functions).
+//
+// It contains four independent, self-contained tests. Edit the parameters in the
+// PARAMETERS block, then run each section (separate by the // ---- markers).
+//
+//   Test A  Original vs corrected LINEAR, aligned for the end-vs-start label offset.
+//   Test B  Original vs corrected STAIRSTEP, aligned for the label offset.
+//   Test C  Per-tag auto dispatch (fn_ww_twa_auto) output.
+//   Test D  Corrected output vs a pasted Wonderware Historian reference (exact validation).
+//
+// Alignment note: the originals label each bucket at the interval START (bin());
+// the _v2 functions label at the interval END (Wonderware convention). To compare the
+// SAME underlying interval we join original.timestamp == v2.timestamp - interval.
+// Any remaining delta is real (interpolation exactness, quality/gap handling), not labeling.
+// =====================================================================================
+
+
+// ---- PARAMETERS ---------------------------------------------------------------------
+// Copy this block to the top of whichever test you run.
+let _start   = datetime(2026-07-28 18:25:00);
+let _end     = datetime(2026-07-28 18:51:00);
+let _interval = 1m;
+let _tags    = dynamic([]);      // [] = all enabled tags, or e.g. dynamic(['Melter1.Pullrate'])
+let _area    = '*';
+// -------------------------------------------------------------------------------------
+
+
+// =====================================================================================
+// TEST A — LINEAR: original fn_ww_twa_linear vs corrected fn_ww_twa_linear_v2
+// =====================================================================================
+let _start   = datetime(2026-07-28 18:25:00);
+let _end     = datetime(2026-07-28 18:51:00);
+let _interval = 1m;
+let _tags    = dynamic([]);
+let _area    = '*';
+let orig = fn_ww_twa_linear(_start, _end, _interval, _tags, _area)
+    | project tag_name, interval_start = timestamp, orig_value = value;
+let v2 = fn_ww_twa_linear_v2(_start, _end, _interval, _tags, _area)
+    | project tag_name, interval_end = timestamp, v2_value = value;
+orig
+| join kind=fullouter (
+    v2 | extend interval_start = interval_end - _interval
+  ) on tag_name, interval_start
+| project
+    tag_name = coalesce(tag_name, tag_name1),
+    interval_start = coalesce(interval_start, interval_start1),
+    orig_value,          // original (start-labeled)
+    v2_value,            // corrected (end-labeled, shown against its own interval)
+    abs_diff = abs(orig_value - v2_value),
+    pct_diff = iff(v2_value == 0.0, real(null), abs(orig_value - v2_value) / abs(v2_value) * 100.0)
+| order by tag_name asc, interval_start asc
+
+
+// -------------------------------------------------------------------------------------
+// TEST B — STAIRSTEP: original fn_ww_twa_stair vs corrected fn_ww_twa_stair_v2
+// -------------------------------------------------------------------------------------
+let _start   = datetime(2026-07-28 18:25:00);
+let _end     = datetime(2026-07-28 18:51:00);
+let _interval = 1m;
+let _tags    = dynamic([]);
+let _area    = '*';
+let orig = fn_ww_twa_stair(_start, _end, _interval, _tags, _area)
+    | project tag_name, interval_start = timestamp, orig_value = value;
+let v2 = fn_ww_twa_stair_v2(_start, _end, _interval, _tags, _area)
+    | project tag_name, interval_end = timestamp, v2_value = value;
+orig
+| join kind=fullouter (
+    v2 | extend interval_start = interval_end - _interval
+  ) on tag_name, interval_start
+| project
+    tag_name = coalesce(tag_name, tag_name1),
+    interval_start = coalesce(interval_start, interval_start1),
+    orig_value,
+    v2_value,
+    abs_diff = abs(orig_value - v2_value),
+    pct_diff = iff(v2_value == 0.0, real(null), abs(orig_value - v2_value) / abs(v2_value) * 100.0)
+| order by tag_name asc, interval_start asc
+
+
+// -------------------------------------------------------------------------------------
+// TEST C — AUTO DISPATCH: fn_ww_twa_auto (per-tag Linear/StairStep from config)
+// -------------------------------------------------------------------------------------
+let _start   = datetime(2026-07-28 18:25:00);
+let _end     = datetime(2026-07-28 18:51:00);
+let _interval = 1m;
+let _tags    = dynamic([]);
+let _area    = '*';
+fn_ww_twa_auto(_start, _end, _interval, _tags, _area)
+| join kind=leftouter (ww_tag_config | project tag_name, interpolation_type) on tag_name
+| project tag_name, interpolation_type, timestamp, value, mode
+| order by tag_name asc, timestamp asc
+
+
+// -------------------------------------------------------------------------------------
+// TEST D — EXACT VALIDATION vs Wonderware Historian reference.
+//
+// Paste the Historian export into the datatable below (timestamp = END-of-interval label,
+// exactly as Historian reports it). Choose the matching v2 function for the tag's
+// interpolation type (linear shown; swap to fn_ww_twa_stair_v2 for stair tags).
+// A PASS row means |KQL - Historian| is within tolerance.
+// -------------------------------------------------------------------------------------
+let _start   = datetime(2026-07-28 18:25:00);
+let _end     = datetime(2026-07-28 18:51:00);
+let _interval = 1m;
+let _tags    = dynamic(['Melter1.Pullrate']);
+let _area    = '*';
+let _tolerance = 0.01;   // absolute tolerance for PASS/FAIL
+let historian_ref = datatable(tag_name:string, timestamp:datetime, hist_value:real)
+[
+    // tag_name,                 timestamp (interval END),         Historian value
+    'Melter1.Pullrate', datetime(2026-06-10 14:03:00), 4499.36875893129,
+    'Melter1.Pullrate', datetime(2026-06-10 14:04:00), 4502.10380236575,
+    'Melter1.Pullrate', datetime(2026-06-10 14:05:00), 4511.63390941851,
+    // ... paste the rest of the Historian rows here ...
+];
+let kql = fn_ww_twa_linear_v2(_start, _end, _interval, _tags, _area)
+    | project tag_name, timestamp, kql_value = value;
+historian_ref
+| join kind=leftouter kql on tag_name, timestamp
+| project tag_name, timestamp, hist_value, kql_value,
+          abs_diff = abs(hist_value - kql_value),
+          result = iff(isnull(kql_value), 'MISSING',
+                   iff(abs(hist_value - kql_value) <= _tolerance, 'PASS', 'FAIL'))
+| order by tag_name asc, timestamp asc
+// Optional one-line summary — run instead of the projection above:
+// | summarize total = count(), passed = countif(result == 'PASS'),
+//             failed = countif(result == 'FAIL'), max_abs_diff = max(abs_diff) by tag_name

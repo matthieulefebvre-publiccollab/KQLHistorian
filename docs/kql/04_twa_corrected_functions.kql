@@ -1,0 +1,162 @@
+// =====================================================================================
+// Corrected TWA functions — align KQL output with Wonderware Historian semantics.
+//
+// Diagnosis (see issue/KQLHistorian-TWA-Testing-Data), four independent problems were
+// found by comparing Historian TWA vs the original fn_ww_twa_* output:
+//
+//   1) LABEL OFFSET (all scenarios). Wonderware timestamps each bucket at the END of the
+//      averaging interval; the original functions used bin() = interval START. Net effect:
+//      Historian[T] == KQL[T - interval]. Proven EXACTLY on the stair-step tag (Scenario 3)
+//      and to ~4 decimals on the slow linear tag (Scenario 2).
+//         Fix: label buckets at (bucket + interval).
+//
+//   2) INTERPOLATION TYPE PER TAG (Scenario 4). The Scenario-4 tag behaves as StairStep in
+//      Wonderware, but was queried through fn_ww_twa_linear. Historian used step-hold,
+//      KQL used linear -> every transition diverged (e.g. Historian 147.9581 vs KQL 147.771
+//      for interval 14:35-14:36). Scenario 2 tag is genuinely Linear and matched.
+//         Fix: drive interpolation from ww_tag_config.interpolation_type (fn_ww_twa_auto).
+//
+//   3) 5-SECOND DENSIFICATION LOSS (Scenarios 1 & 4). The original linear function used
+//      make-series step 5s + any(value) + avg(). Multiple raw points inside one 5s slot
+//      collapse to a single arbitrary value (Scenario 4's 14:18:00.000 dip and its
+//      14:18:02.529 recovery fell in the same 5s slot -> the dip vanished), and avg() over a
+//      5s grid is only an approximation of the true integral.
+//         Fix: exact per-segment trapezoidal integration; no densification, no lost points.
+//
+//   4) FABRICATION ACROSS BAD-QUALITY GAPS (Scenario 2). The original linear function
+//      ignored `quality` and used series_fill_linear, which bridged a ~19.75h bad-quality
+//      dropout with a straight ramp (KQL 43.912 climbing) while Historian correctly returned
+//      NULL for the whole gap.
+//         Fix: quality-aware. Only integrate segments whose endpoints are Good; any bucket
+//         that overlaps a bad/NULL span or is not fully covered -> NULL.
+//
+// These are drop-in "_v2" replacements so the originals remain for comparison. Once
+// validated, repoint fn_ww_view to the _v2 functions (see bottom of file).
+// =====================================================================================
+
+// -------------------------------------------------------------------------------------
+// Stair-step TWA (corrected): exact segment integration, quality-aware, end-of-interval label.
+// -------------------------------------------------------------------------------------
+.create-or-alter function with (
+    docstring = 'Corrected StairStep TWA: exact integration, quality-aware, end-of-interval timestamp (Wonderware-compatible).',
+    folder = 'WonderwareCompat'
+)
+fn_ww_twa_stair_v2(start_time:datetime, end_time:datetime, interval:timespan=1m, tag_filter:dynamic=dynamic([]), area_filter:string='*', good_quality:string='Good')
+{
+    let interval_sec = interval / 1s;
+    let segs =
+        fn_ww_raw_effective(start_time, end_time, tag_filter, area_filter)
+        | extend is_good = (quality == good_quality and isnotnull(value))
+        | order by tag_name asc, source_timestamp asc
+        | serialize
+        | extend next_ts = next(source_timestamp), next_tag = next(tag_name)
+        | where tag_name == next_tag
+        // StairStep: the segment holds the value at its left endpoint. The segment is a gap
+        // whenever that left endpoint is not Good.
+        | extend seg_start = source_timestamp, seg_end = next_ts, seg_value = value, seg_good = is_good
+        | where seg_end > start_time and seg_start < end_time
+        | extend seg_start = max_of(seg_start, start_time), seg_end = min_of(seg_end, end_time);
+    segs
+    | extend b0 = bin(seg_start, interval), b1 = bin(seg_end - 1tick, interval)
+    | mv-expand bucket = range(b0, b1, interval) to typeof(datetime)
+    | extend ov_s = max_of(seg_start, bucket), ov_e = min_of(seg_end, bucket + interval)
+    | extend w_sec = datetime_diff('millisecond', ov_e, ov_s) / 1000.0
+    | where w_sec > 0
+    | summarize weighted_sum = sum(iff(seg_good, seg_value * w_sec, real(null))),
+                good_sec = sum(iff(seg_good, w_sec, 0.0)),
+                bad_sec  = sum(iff(seg_good, 0.0, w_sec)),
+                covered_sec = sum(w_sec)
+             by tag_name, bucket
+    | extend value = iff(bad_sec > 0.0 or good_sec <= 0.0 or covered_sec < interval_sec - 0.001,
+                         real(null),
+                         weighted_sum / good_sec)
+    | project tag_name, timestamp = bucket + interval, value, mode = 'TWA_StairStep'
+    | order by tag_name asc, timestamp asc
+}
+
+// -------------------------------------------------------------------------------------
+// Linear TWA (corrected): exact trapezoidal integration, quality-aware, end-of-interval label.
+// No make-series / no 5s densification -> sub-second points are preserved and the integral
+// is exact rather than sampled.
+// -------------------------------------------------------------------------------------
+.create-or-alter function with (
+    docstring = 'Corrected Linear TWA: exact trapezoidal integration, quality-aware, end-of-interval timestamp (Wonderware-compatible).',
+    folder = 'WonderwareCompat'
+)
+fn_ww_twa_linear_v2(start_time:datetime, end_time:datetime, interval:timespan=1m, tag_filter:dynamic=dynamic([]), area_filter:string='*', good_quality:string='Good')
+{
+    let interval_sec = interval / 1s;
+    let segs =
+        fn_ww_raw_effective(start_time, end_time, tag_filter, area_filter)
+        | extend is_good = (quality == good_quality and isnotnull(value))
+        | order by tag_name asc, source_timestamp asc
+        | serialize
+        | extend next_ts = next(source_timestamp), next_tag = next(tag_name), next_val = next(value), next_good = next(is_good)
+        | where tag_name == next_tag
+        // A linear segment is valid only when BOTH endpoints are Good (otherwise the span is a gap).
+        | extend seg_start = source_timestamp, seg_end = next_ts, v0 = value, v1 = next_val, seg_good = (is_good and next_good)
+        | where seg_end > start_time and seg_start < end_time;
+    segs
+    | extend b0 = bin(seg_start, interval), b1 = bin(seg_end - 1tick, interval)
+    | mv-expand bucket = range(b0, b1, interval) to typeof(datetime)
+    | extend ov_s = max_of(max_of(seg_start, bucket), start_time),
+             ov_e = min_of(min_of(seg_end, bucket + interval), end_time)
+    | where ov_e > ov_s
+    | extend seg_dur_ms = datetime_diff('millisecond', seg_end, seg_start) * 1.0
+    // Linearly interpolate the segment value at the clipped bucket-overlap boundaries.
+    | extend f_s = datetime_diff('millisecond', ov_s, seg_start) / seg_dur_ms,
+             f_e = datetime_diff('millisecond', ov_e, seg_start) / seg_dur_ms
+    | extend val_s = v0 + (v1 - v0) * f_s, val_e = v0 + (v1 - v0) * f_e
+    | extend w_sec = datetime_diff('millisecond', ov_e, ov_s) / 1000.0
+    | summarize area_sum = sum(iff(seg_good, (val_s + val_e) / 2.0 * w_sec, real(null))),
+                good_sec = sum(iff(seg_good, w_sec, 0.0)),
+                bad_sec  = sum(iff(seg_good, 0.0, w_sec)),
+                covered_sec = sum(w_sec)
+             by tag_name, bucket
+    | extend value = iff(bad_sec > 0.0 or good_sec <= 0.0 or covered_sec < interval_sec - 0.001,
+                         real(null),
+                         area_sum / good_sec)
+    | project tag_name, timestamp = bucket + interval, value, mode = 'TWA_Linear'
+    | order by tag_name asc, timestamp asc
+}
+
+// -------------------------------------------------------------------------------------
+// Per-tag auto dispatch: choose Linear vs StairStep from ww_tag_config.interpolation_type.
+// This is what fixes Scenario 4 without the caller having to know each tag's type.
+// -------------------------------------------------------------------------------------
+.create-or-alter function with (
+    docstring = 'Auto TWA: routes each tag to Linear or StairStep integration based on ww_tag_config.interpolation_type.',
+    folder = 'WonderwareCompat'
+)
+fn_ww_twa_auto(start_time:datetime, end_time:datetime, interval:timespan=1m, tag_filter:dynamic=dynamic([]), area_filter:string='*')
+{
+    let stair_tags = toscalar(
+        ww_tag_config
+        | where is_enabled and interpolation_type =~ 'StairStep'
+        | where array_length(tag_filter) == 0 or tag_name in (tag_filter)
+        | summarize make_set(tag_name));
+    let linear_tags = toscalar(
+        ww_tag_config
+        | where is_enabled and interpolation_type !~ 'StairStep'
+        | where array_length(tag_filter) == 0 or tag_name in (tag_filter)
+        | summarize make_set(tag_name));
+    union
+        (fn_ww_twa_stair_v2(start_time, end_time, interval, stair_tags, area_filter)),
+        (fn_ww_twa_linear_v2(start_time, end_time, interval, linear_tags, area_filter))
+    | order by tag_name asc, timestamp asc
+}
+
+// -------------------------------------------------------------------------------------
+// After validation, repoint the public entrypoint to the corrected functions:
+//
+// .create-or-alter function with (folder='WonderwareCompat')
+// fn_ww_view(retrieval_mode:string, start_time:datetime, end_time:datetime, interval:timespan, tag_filter:dynamic, area_filter:string)
+// {
+//     union
+//       (fn_ww_cyclic(start_time, end_time, interval, tag_filter, area_filter) | extend _mode='Cyclic'),
+//       (fn_ww_twa_stair_v2(start_time, end_time, interval, tag_filter, area_filter) | extend _mode='TWA_StairStep'),
+//       (fn_ww_twa_linear_v2(start_time, end_time, interval, tag_filter, area_filter) | extend _mode='TWA_Linear')
+//     | where _mode =~ retrieval_mode
+//     | project-away _mode
+// }
+// =====================================================================================
