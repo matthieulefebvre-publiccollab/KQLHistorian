@@ -16,6 +16,8 @@ docs/
     01_schema_and_functions.kql             ← tables, MV, fn_ww_* functions
     02_seed_sample_data.kql                 ← demo data (now()-relative)
     03_validation_tests.kql                 ← per-mode sanity checks
+    04_twa_corrected_functions.kql          ← Wonderware-accurate fn_ww_twa_*_v2 functions
+    05_twa_comparison_test.kql              ← original-vs-corrected-vs-Historian validation harness
   dashboard/
     WonderwareRealtimeDashboard.template.json  ← parameterized dashboard definition
 scripts/
@@ -52,7 +54,7 @@ Run `az login --allow-no-subscriptions` (with `--tenant <id>` if needed) before 
 ### 1. Clone and configure
 
 ```powershell
-git clone https://github.com/christophermschmidt/KQLHistorian.git
+git clone https://github.com/matthieulefebvre-publiccollab/KQLHistorian.git
 cd KQLHistorian
 copy .env.example .env
 notepad .env
@@ -76,6 +78,9 @@ Open the KQL DB in the Fabric UI and run, in order:
 
 1. [`docs/kql/01_schema_and_functions.kql`](docs/kql/01_schema_and_functions.kql) — creates `ww_tag_config`, `ww_raw_analog`, `ww_query_audit`, the `ww_mv_latest_by_tag` materialized view, and the `fn_ww_*` retrieval functions.
 2. [`docs/kql/02_seed_sample_data.kql`](docs/kql/02_seed_sample_data.kql) — populates 4 tags with `now()`-relative sample points covering the last 30 minutes, including one late-arriving point that demonstrates retroactive drift.
+3. [`docs/kql/04_twa_corrected_functions.kql`](docs/kql/04_twa_corrected_functions.kql) — installs the Wonderware-accurate `fn_ww_twa_stair_v2`, `fn_ww_twa_linear_v2`, and `fn_ww_twa_auto` functions (drop-in `_v2` replacements; the originals stay for comparison). See [TWA accuracy corrections](#twa-accuracy-corrections) below.
+
+To validate the corrected functions against real Historian output, run [`docs/kql/05_twa_comparison_test.kql`](docs/kql/05_twa_comparison_test.kql) — a four-part harness (Test A: linear original-vs-v2, Test B: stairstep original-vs-v2, Test C: per-tag auto dispatch, Test D: corrected-vs-pasted-Historian exact validation). Edit the `PARAMETERS` block, then run each `// ----`-delimited section on its own.
 
 Alternatively re-seed from PowerShell any time the demo window goes stale:
 
@@ -146,6 +151,21 @@ Prints the JSON definition of the `_retrieval_mode` parameter. Useful if you edi
 Late-arriving points retroactively change **TWA Linear** the most, **TWA StairStep** moderately, and **Cyclic not at all** (Cyclic only cares about the last value at-or-before each boundary — once that boundary passes with no point present, a later arrival doesn't move it).
 
 For full background and worked examples see [`docs/End-to-End-Historian-KQL-Guide.md`](docs/End-to-End-Historian-KQL-Guide.md).
+
+---
+
+## TWA accuracy corrections
+
+Comparing the original `fn_ww_twa_*` output against real Wonderware Historian TWA exports surfaced four independent discrepancies. [`docs/kql/04_twa_corrected_functions.kql`](docs/kql/04_twa_corrected_functions.kql) fixes all four as drop-in `_v2` functions:
+
+| # | Problem | Symptom | Fix in `_v2` |
+|---|---|---|---|
+| 1 | **Label offset** | Wonderware timestamps each bucket at the interval **end**; the originals used `bin()` = interval **start**, so `Historian[T] == KQL[T − interval]` | Label buckets at `(bucket + interval)` |
+| 2 | **Wrong interpolation per tag** | A stair-step tag was averaged as linear, so every transition diverged | Drive interpolation from `ww_tag_config.interpolation_type` via `fn_ww_twa_auto` |
+| 3 | **5-second densification loss** | `make-series` at 5s + `any(value)` collapsed sub-5s points and only approximated the integral | Exact per-segment trapezoidal integration — no densification, no lost points |
+| 4 | **Fabrication across bad-quality gaps** | `series_fill_linear` bridged a multi-hour bad-quality dropout with a fake ramp instead of `NULL` | Quality-aware: only integrate Good→Good segments; any bucket overlapping a bad/NULL span → `NULL` |
+
+Once validated with `05_twa_comparison_test.kql`, repoint `fn_ww_view` to the `_v2` functions (see the note at the bottom of `04_twa_corrected_functions.kql`).
 
 ---
 
